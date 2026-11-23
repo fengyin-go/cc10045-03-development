@@ -85,17 +85,14 @@ def ingest_events(event_definitions: list[dict[str, Any]], batch_id: str | None 
 # 实时聚合管道：从事件表读取数据，按窗口维度执行聚合
 # ============================================================================
 
-def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
-    """对指定聚合窗口执行计算。
+def _event_groups_for_window(window: dict[str, Any]) -> tuple[list[dict[str, Any]], str, str, list[Any]]:
+    """按窗口配置从 events 表读取并分组，返回 (分组结果, window_start, window_end, 维度列表)。
 
-    从 events 表读取匹配数据源，按维度分组，在时间窗口内执行聚合函数。
-    结果写入 aggregation_results 表，返回新增结果列表。
+    纯计算函数，不写任何表，供实时聚合与口径试算共用，保证两种口径的计算逻辑完全一致。
     """
-    window_id = window["id"]
-    data_source = window.get("数据源", "")
-    dimensions_raw = window.get("聚合维度", "[]")
-    agg_func = window.get("聚合函数", "COUNT")
-    window_type = window.get("window_type", "tumbling")
+    data_source = window.get("数据源") or window.get("data_source_module", "")
+    dimensions_raw = window.get("聚合维度", window.get("dimensions", "[]"))
+    window_type = window.get("window_type", "tumbling")  # noqa: F841 保留语义
     window_size = window.get("窗口大小", window.get("window_size_seconds", 60))
 
     try:
@@ -107,7 +104,6 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
     window_end = now_dt.replace(microsecond=0)
     window_start = window_end - timedelta(seconds=int(window_size))
 
-    # 查询窗口内的事件
     events_query = "SELECT * FROM events WHERE occurred_at >= ? AND occurred_at < ?"
     params = [window_start.strftime("%Y-%m-%dT%H:%M:%S"), window_end.strftime("%Y-%m-%dT%H:%M:%S")]
 
@@ -117,10 +113,6 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
 
     events = db.fetchall(events_query, params)
 
-    if not events:
-        return []
-
-    # 按维度分组
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for evt in events:
         if dims:
@@ -132,10 +124,98 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
             dim_key = "|".join(str(attrs.get(d, "?")) for d in dims)
         else:
             dim_key = "__all__"
-
         groups[dim_key].append(evt)
 
-    # 执行聚合
+    return groups, window_start.strftime("%Y-%m-%dT%H:%M:%S"), window_end.strftime("%Y-%m-%dT%H:%M:%S"), dims
+
+
+def _apply_agg_function(agg_func: str, group_events: list[dict[str, Any]]) -> float:
+    """对单个分组执行聚合函数，返回聚合值。"""
+    agg_func_upper = (agg_func or "COUNT").upper().strip()
+
+    def _amounts() -> list[float]:
+        vals = []
+        for e in group_events:
+            try:
+                vals.append(float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)))
+            except Exception:
+                vals.append(0.0)
+        return vals
+
+    if agg_func_upper == "COUNT":
+        value = float(len(group_events))
+    elif agg_func_upper in ("SUM", "总金额", "总量"):
+        try:
+            value = sum(_amounts())
+        except Exception:
+            value = float(len(group_events))
+    elif agg_func_upper in ("AVG", "均值"):
+        try:
+            vals = _amounts()
+            value = statistics.mean(vals) if vals else 0.0
+        except Exception:
+            value = float(len(group_events))
+    elif agg_func_upper in ("MAX", "最大值"):
+        try:
+            vals = _amounts()
+            value = max(vals) if vals else 0.0
+        except Exception:
+            value = float(len(group_events))
+    elif agg_func_upper in ("MIN", "最小值"):
+        try:
+            vals = _amounts()
+            value = min(vals) if vals else 0.0
+        except Exception:
+            value = float(len(group_events))
+    elif agg_func_upper == "COUNT_DISTINCT":
+        try:
+            vals = set(json.loads(e.get("event_attrs", "{}")).get("user_id", "") for e in group_events)
+            value = float(len(vals))
+        except Exception:
+            value = float(len(group_events))
+    else:
+        value = float(len(group_events))
+    return round(value, 4)
+
+
+def calculate_window_groups(window: dict[str, Any]) -> dict[str, Any]:
+    """计算窗口当前事件数据的整轮分组结果（不写库）。
+
+    返回 {window_start, window_end, dimensions, groups: [{dimension_key, computed_value, event_count}]}。
+    试算与实时聚合共用此函数，确保候选结果与正式聚合的口径一致。
+    """
+    groups, window_start, window_end, dims = _event_groups_for_window(window)
+    agg_func = window.get("聚合函数", window.get("agg_function", "COUNT"))
+    group_rows = [
+        {
+            "dimension_key": dim_key,
+            "computed_value": _apply_agg_function(agg_func, group_events),
+            "event_count": len(group_events),
+        }
+        for dim_key, group_events in groups.items()
+    ]
+    group_rows.sort(key=lambda r: r["dimension_key"])
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "dimensions": dims,
+        "groups": group_rows,
+    }
+
+
+def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
+    """对指定聚合窗口执行计算。
+
+    从 events 表读取匹配数据源，按维度分组，在时间窗口内执行聚合函数。
+    结果写入 aggregation_results 表，返回新增结果列表。
+    """
+    window_id = window["id"]
+    calc = calculate_window_groups(window)
+
+    if not calc["groups"]:
+        return []
+
+    # 按维度分组
     results = []
     version = db.fetchone(
         "SELECT COALESCE(MAX(computation_version), 0)+1 as v FROM aggregation_results WHERE window_id=?",
@@ -143,58 +223,22 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
     )
     comp_version = int(version["v"]) if version else 1
 
-    agg_func_upper = agg_func.upper().strip()
-
-    for dim_key, group_events in groups.items():
-        if agg_func_upper == "COUNT":
-            value = float(len(group_events))
-        elif agg_func_upper in ("SUM", "总金额", "总量"):
-            try:
-                value = sum(float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events)
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper in ("AVG", "均值"):
-            try:
-                vals = [float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events]
-                value = statistics.mean(vals) if vals else 0.0
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper in ("MAX", "最大值"):
-            try:
-                vals = [float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events]
-                value = max(vals) if vals else 0.0
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper in ("MIN", "最小值"):
-            try:
-                vals = [float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events]
-                value = min(vals) if vals else 0.0
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper == "COUNT_DISTINCT":
-            try:
-                vals = set(json.loads(e.get("event_attrs", "{}")).get("user_id", "") for e in group_events)
-                value = float(len(vals))
-            except Exception:
-                value = float(len(group_events))
-        else:
-            value = float(len(group_events))
-
+    for row in calc["groups"]:
         record_id = db.insert("aggregation_results", {
             "window_id": window_id,
-            "window_start": window_start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "window_end": window_end.strftime("%Y-%m-%dT%H:%M:%S"),
-            "dimension_key": dim_key,
-            "computed_value": round(value, 4),
-            "event_count": len(group_events),
+            "window_start": calc["window_start"],
+            "window_end": calc["window_end"],
+            "dimension_key": row["dimension_key"],
+            "computed_value": row["computed_value"],
+            "event_count": row["event_count"],
             "computation_version": comp_version,
         })
         results.append({
             "id": record_id,
             "window_id": window_id,
-            "dimension_key": dim_key,
-            "computed_value": round(value, 4),
-            "event_count": len(group_events),
+            "dimension_key": row["dimension_key"],
+            "computed_value": row["computed_value"],
+            "event_count": row["event_count"],
         })
 
     return results

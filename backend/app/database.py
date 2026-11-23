@@ -68,6 +68,56 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_agg_results_window ON aggregation_results(window_id, window_start)",
     "CREATE INDEX IF NOT EXISTS idx_agg_results_dim ON aggregation_results(dimension_key)",
 
+    # ==================== 口径版本化（试算/启用/撤销） ====================
+    # 每个窗口的一轮口径版本：状态机 + 不可变整轮分组结果，启用版本由窗口状态指针指向。
+    """CREATE TABLE IF NOT EXISTS aggregation_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_id INTEGER NOT NULL,
+        version_no INTEGER NOT NULL,
+        caliber_code TEXT NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL CHECK(status IN ('试算中','候选','试算失败','已启用','已确认','已撤销')),
+        fail_reason TEXT,
+        window_start TEXT,
+        window_end TEXT,
+        group_count INTEGER NOT NULL DEFAULT 0,
+        total_value REAL NOT NULL DEFAULT 0.0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        activated_at TEXT,
+        revoked_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agg_ver_window ON aggregation_versions(window_id, version_no)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agg_ver_caliber ON aggregation_versions(window_id, caliber_code)",
+
+    """CREATE TABLE IF NOT EXISTS aggregation_version_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id INTEGER NOT NULL,
+        dimension_key TEXT NOT NULL,
+        computed_value REAL NOT NULL DEFAULT 0.0,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (version_id) REFERENCES aggregation_versions(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agg_vg_version ON aggregation_version_groups(version_id)",
+
+    # 窗口 → 当前启用版本指针：启用/撤销只改这一个指针，保证整轮原子切换。
+    """CREATE TABLE IF NOT EXISTS aggregation_window_states (
+        window_id INTEGER PRIMARY KEY,
+        active_version_id INTEGER,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+
+    # 取数请求留痕：记录每次仪表盘/值班取数实际使用的口径版本，支持事后原样回查。
+    """CREATE TABLE IF NOT EXISTS aggregation_fetch_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_id INTEGER NOT NULL,
+        version_id INTEGER NOT NULL,
+        caliber_code TEXT NOT NULL,
+        fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+        consumer TEXT NOT NULL DEFAULT 'dashboard'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agg_fetch_window ON aggregation_fetch_log(window_id, fetched_at)",
+
     # ==================== Metric Tier ====================
     """CREATE TABLE IF NOT EXISTS metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -443,6 +493,27 @@ class AnalyticsDB:
     def count(self, table: str, where: str = "1=1", params: Sequence[Any] = ()) -> int:
         row = self.fetchone(f"SELECT COUNT(*) as cnt FROM {table} WHERE {where}", params)
         return int(row["cnt"]) if row else 0
+
+    def read_snapshot(self, reader):
+        """在单一连接的只读事务里执行 reader(conn)，保证一次读取看到同一 WAL 快照。
+
+        试算启用/撤销与仪表盘取数交错时，取数全程使用同一个连接与事务视图，
+        因此整轮分组结果要么全是旧口径、要么全是新口径，绝不会混读两轮。
+        """
+        conn = self._get_conn()
+        prev_isolation = conn.isolation_level
+        try:
+            conn.isolation_level = None  # 进入 autocommit 后手动开只读事务
+            conn.execute("BEGIN")
+            try:
+                result = reader(conn)
+            except Exception:
+                conn.rollback()  # 异常时释放快照，避免连接残留事务
+                raise
+            conn.rollback()  # 只读事务，回滚即释放快照
+            return result
+        finally:
+            conn.isolation_level = prev_isolation
 
     def table_names(self) -> list[str]:
         rows = self.fetchall("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
